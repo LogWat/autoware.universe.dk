@@ -43,6 +43,7 @@
   <depend>autoware_route_handler</depend>
   <depend>autoware_universe_utils</depend>
   <depend>autoware_velocity_smoother</depend>
+  <depend>grid_map_core</depend>
   <depend>diagnostic_msgs</depend>
   <depend>eigen</depend>
   <depend>geometry_msgs</depend>
