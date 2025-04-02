@@ -14,25 +14,24 @@
 
 #include "autoware/lidar_centerpoint/node.hpp"
 
-#include "pcl_ros/transforms.hpp"
+#include "autoware/lidar_centerpoint/centerpoint_config.hpp"
+#include "autoware/lidar_centerpoint/preprocess/pointcloud_densification.hpp"
+#include "autoware/lidar_centerpoint/ros_utils.hpp"
+#include "autoware/lidar_centerpoint/utils.hpp"
 
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
+#include <pcl_ros/transforms.hpp>
 
 #include <memory>
 #include <string>
 #include <vector>
 
 #ifdef ROS_DISTRO_GALACTIC
-#include "tf2_geometry_msgs/tf2_geometry_msgs.h"
+#include <tf2_geometry_msgs/tf2_geometry_msgs.h>
 #else
-#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #endif
-
-#include "autoware/lidar_centerpoint/centerpoint_config.hpp"
-#include "autoware/lidar_centerpoint/preprocess/pointcloud_densification.hpp"
-#include "autoware/lidar_centerpoint/ros_utils.hpp"
-#include "autoware/lidar_centerpoint/utils.hpp"
 
 namespace autoware::lidar_centerpoint
 {
@@ -86,8 +85,8 @@ LidarCenterPointNode::LidarCenterPointNode(const rclcpp::NodeOptions & node_opti
     iou_bev_nms_.setParameters(p);
   }
 
-  NetworkParam encoder_param(encoder_onnx_path, encoder_engine_path, trt_precision);
-  NetworkParam head_param(head_onnx_path, head_engine_path, trt_precision);
+  TrtCommonConfig encoder_param(encoder_onnx_path, trt_precision, encoder_engine_path);
+  TrtCommonConfig head_param(head_onnx_path, trt_precision, head_engine_path);
   DensificationParam densification_param(
     densification_world_frame_id, densification_num_past_frames);
 
@@ -107,17 +106,20 @@ LidarCenterPointNode::LidarCenterPointNode(const rclcpp::NodeOptions & node_opti
     circle_nms_dist_threshold, yaw_norm_thresholds, has_variance_);
   detector_ptr_ =
     std::make_unique<CenterPointTRT>(encoder_param, head_param, densification_param, config);
+  diagnostics_interface_ptr_ =
+    std::make_unique<autoware_utils::DiagnosticsInterface>(this, "centerpoint_trt");
 
-  pointcloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-    "~/input/pointcloud", rclcpp::SensorDataQoS{}.keep_last(1),
-    std::bind(&LidarCenterPointNode::pointCloudCallback, this, std::placeholders::_1));
+  pointcloud_sub_ =
+    std::make_unique<cuda_blackboard::CudaBlackboardSubscriber<cuda_blackboard::CudaPointCloud2>>(
+      *this, "~/input/pointcloud",
+      std::bind(&LidarCenterPointNode::pointCloudCallback, this, std::placeholders::_1));
   objects_pub_ = this->create_publisher<autoware_perception_msgs::msg::DetectedObjects>(
     "~/output/objects", rclcpp::QoS{1});
 
   // initialize debug tool
   {
-    using autoware::universe_utils::DebugPublisher;
-    using autoware::universe_utils::StopWatch;
+    using autoware_utils::DebugPublisher;
+    using autoware_utils::StopWatch;
     stop_watch_ptr_ = std::make_unique<StopWatch<std::chrono::milliseconds>>();
     debug_publisher_ptr_ = std::make_unique<DebugPublisher>(this, "lidar_centerpoint");
     stop_watch_ptr_->tic("cyclic_time");
@@ -128,12 +130,11 @@ LidarCenterPointNode::LidarCenterPointNode(const rclcpp::NodeOptions & node_opti
     RCLCPP_INFO(this->get_logger(), "TensorRT engine is built and shutdown node.");
     rclcpp::shutdown();
   }
-  published_time_publisher_ =
-    std::make_unique<autoware::universe_utils::PublishedTimePublisher>(this);
+  published_time_publisher_ = std::make_unique<autoware_utils::PublishedTimePublisher>(this);
 }
 
 void LidarCenterPointNode::pointCloudCallback(
-  const sensor_msgs::msg::PointCloud2::ConstSharedPtr input_pointcloud_msg)
+  const std::shared_ptr<const cuda_blackboard::CudaPointCloud2> & input_pointcloud_msg)
 {
   const auto objects_sub_count =
     objects_pub_->get_subscription_count() + objects_pub_->get_intra_process_subscription_count();
@@ -144,11 +145,23 @@ void LidarCenterPointNode::pointCloudCallback(
   if (stop_watch_ptr_) {
     stop_watch_ptr_->toc("processing_time", true);
   }
+  diagnostics_interface_ptr_->clear();
 
   std::vector<Box3D> det_boxes3d;
-  bool is_success = detector_ptr_->detect(*input_pointcloud_msg, tf_buffer_, det_boxes3d);
+  bool is_num_pillars_within_range = true;
+  bool is_success = detector_ptr_->detect(
+    input_pointcloud_msg, tf_buffer_, det_boxes3d, is_num_pillars_within_range);
   if (!is_success) {
     return;
+  }
+  diagnostics_interface_ptr_->add_key_value(
+    "is_num_pillars_within_range", is_num_pillars_within_range);
+  if (!is_num_pillars_within_range) {
+    std::stringstream message;
+    message << "CenterPointTRT::detect: The actual number of pillars exceeds its maximum value, "
+            << "which may limit the detection performance.";
+    diagnostics_interface_ptr_->update_level_and_message(
+      diagnostic_msgs::msg::DiagnosticStatus::WARN, message.str());
   }
 
   std::vector<autoware_perception_msgs::msg::DetectedObject> raw_objects;
@@ -169,6 +182,7 @@ void LidarCenterPointNode::pointCloudCallback(
     objects_pub_->publish(output_msg);
     published_time_publisher_->publish_if_subscribed(objects_pub_, output_msg.header.stamp);
   }
+  diagnostics_interface_ptr_->publish(input_pointcloud_msg->header.stamp);
 
   // add processing time for debug
   if (debug_publisher_ptr_ && stop_watch_ptr_) {
@@ -179,11 +193,11 @@ void LidarCenterPointNode::pointCloudCallback(
         std::chrono::nanoseconds(
           (this->get_clock()->now() - output_msg.header.stamp).nanoseconds()))
         .count();
-    debug_publisher_ptr_->publish<tier4_debug_msgs::msg::Float64Stamped>(
+    debug_publisher_ptr_->publish<autoware_internal_debug_msgs::msg::Float64Stamped>(
       "debug/cyclic_time_ms", cyclic_time_ms);
-    debug_publisher_ptr_->publish<tier4_debug_msgs::msg::Float64Stamped>(
+    debug_publisher_ptr_->publish<autoware_internal_debug_msgs::msg::Float64Stamped>(
       "debug/processing_time_ms", processing_time_ms);
-    debug_publisher_ptr_->publish<tier4_debug_msgs::msg::Float64Stamped>(
+    debug_publisher_ptr_->publish<autoware_internal_debug_msgs::msg::Float64Stamped>(
       "debug/pipeline_latency_ms", pipeline_latency_ms);
   }
 }
